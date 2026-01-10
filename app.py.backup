@@ -1,0 +1,325 @@
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+import sqlite3
+import os
+import time
+import math
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+CORS(app)
+
+# Configuration
+DATABASE = 'reports.db'
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max
+
+# Create uploads folder
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance using Haversine formula (returns km)"""
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return R * c
+
+def find_nearest_ngo(latitude, longitude):
+    """Find nearest NGO to given coordinates"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, name, phone, email, whatsapp, latitude, longitude FROM ngos')
+    ngos = cursor.fetchall()
+    conn.close()
+    
+    if not ngos:
+        return None
+    
+    nearest = None
+    min_distance = float('inf')
+    
+    for ngo in ngos:
+        distance = calculate_distance(float(latitude), float(longitude), ngo[5], ngo[6])
+        if distance < min_distance:
+            min_distance = distance
+            nearest = {
+                'id': ngo[0],
+                'name': ngo[1],
+                'phone': ngo[2],
+                'email': ngo[3],
+                'whatsapp': ngo[4],
+                'distance': round(distance, 2)
+            }
+    
+    return nearest
+
+def send_notifications(ngo, report_id, description, reporter_phone, latitude, longitude):
+    """Send notifications to NGO (console logging for now)"""
+    print(f"\n{'='*60}")
+    print(f"🚨 NEW RESCUE ALERT!")
+    print(f"{'='*60}")
+    print(f"📋 Report ID: {report_id}")
+    print(f"🏥 Assigned NGO: {ngo['name']}")
+    print(f"📞 NGO Phone: {ngo['phone']}")
+    print(f"📧 NGO Email: {ngo['email']}")
+    print(f"💬 WhatsApp: {ngo['whatsapp']}")
+    print(f"📝 Description: {description}")
+    print(f"📍 Distance: {ngo['distance']} km")
+    print(f"📞 Reporter: {reporter_phone}")
+    print(f"🗺️ Location: {latitude}, {longitude}")
+    print(f"{'='*60}\n")
+    
+    # TODO: Add Twilio SMS, SendGrid Email, WhatsApp API integration
+
+def init_db():
+    """Initialize database with tables"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Reports table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description TEXT NOT NULL,
+            reporter_name TEXT NOT NULL,
+            reporter_phone TEXT NOT NULL,
+            latitude REAL,
+            longitude REAL,
+            image_path TEXT,
+            status TEXT DEFAULT 'PENDING',
+            assigned_ngo_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (assigned_ngo_id) REFERENCES ngos(id)
+        )
+    ''')
+    
+    # NGOs table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ngos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            email TEXT,
+            whatsapp TEXT,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Insert sample NGOs if table is empty
+    cursor.execute("SELECT COUNT(*) FROM ngos")
+    if cursor.fetchone()[0] == 0:
+        sample_ngos = [
+            ('Animal Aid Foundation', '9876543210', 'contact@animalaid.org', '9876543210', 28.6139, 77.2090, 'Delhi, India'),
+            ('PFA India', '9876543211', 'help@pfa.org', '9876543211', 19.0760, 72.8777, 'Mumbai, India'),
+            ('Blue Cross of India', '9876543212', 'info@bluecross.org.in', '9876543212', 13.0827, 80.2707, 'Chennai, India'),
+            ('Wildlife SOS', '9876543213', 'rescue@wildlifesos.org', '9876543213', 28.5355, 77.3910, 'Noida, India'),
+            ('SPCA India', '9876543214', 'contact@spcaindia.org', '9876543214', 18.5204, 73.8567, 'Pune, India'),
+        ]
+        cursor.executemany('''
+            INSERT INTO ngos (name, phone, email, whatsapp, latitude, longitude, address)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', sample_ngos)
+    
+    conn.commit()
+    conn.close()
+    print("✅ Database initialized successfully!")
+    print("✅ Sample NGOs added!")
+
+# Initialize database
+init_db()
+
+# ============ API ROUTES ============
+
+@app.route('/')
+def index():
+    return jsonify({
+        'message': 'Animal Rescue API v2.0',
+        'features': [
+            'Auto NGO matching',
+            'Privacy protection',
+            'Notifications ready',
+            'Location-based routing'
+        ]
+    })
+
+@app.route('/api/reports', methods=['GET'])
+def get_reports():
+    """Get all reports (privacy-protected)"""
+    only_open = request.args.get('onlyOpen', 'false').lower() == 'true'
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if only_open:
+        cursor.execute('''
+            SELECT id, description, image_path, status, created_at
+            FROM reports
+            WHERE status != 'RESOLVED'
+            ORDER BY created_at DESC
+        ''')
+    else:
+        cursor.execute('''
+            SELECT id, description, image_path, status, created_at
+            FROM reports
+            ORDER BY created_at DESC
+        ''')
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    reports = []
+    for row in rows:
+        reports.append({
+            'id': row[0],
+            'description': row[1],
+            'image_path': row[2],
+            'status': row[3],
+            'created_at': row[4]
+        })
+    
+    return jsonify(reports)
+
+@app.route('/api/reports/<int:report_id>/details', methods=['GET'])
+def get_report_details(report_id):
+    """Get full report details (for NGO use)"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT r.*, n.name as ngo_name, n.phone as ngo_phone
+        FROM reports r
+        LEFT JOIN ngos n ON r.assigned_ngo_id = n.id
+        WHERE r.id = ?
+    ''', (report_id,))
+    
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return jsonify({'error': 'Report not found'}), 404
+    
+    report = dict(row)
+    return jsonify(report)
+
+@app.route('/api/reports', methods=['POST'])
+def create_report():
+    """Create new report with auto NGO assignment"""
+    try:
+        description = request.form.get('description')
+        reporter_name = request.form.get('reporter_name')
+        reporter_phone = request.form.get('reporter_phone')
+        latitude = request.form.get('latitude')
+        longitude = request.form.get('longitude')
+        
+        if not description or not reporter_name or not reporter_phone:
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        # Handle image upload
+        image_path = None
+        if 'photo' in request.files:
+            file = request.files['photo']
+            if file and file.filename != '' and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                timestamp = str(int(time.time() * 1000))
+                unique_filename = f"{timestamp}_{filename}"
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+                file.save(filepath)
+                image_path = f"/uploads/{unique_filename}"
+        
+        # Find nearest NGO
+        assigned_ngo_id = None
+        nearest_ngo = None
+        if latitude and longitude:
+            nearest_ngo = find_nearest_ngo(float(latitude), float(longitude))
+            if nearest_ngo:
+                assigned_ngo_id = nearest_ngo['id']
+        
+        # Insert report
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO reports (description, reporter_name, reporter_phone, latitude, longitude, image_path, assigned_ngo_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (description, reporter_name, reporter_phone, latitude, longitude, image_path, assigned_ngo_id))
+        
+        report_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        # Send notifications
+        if nearest_ngo:
+            send_notifications(nearest_ngo, report_id, description, reporter_phone, latitude, longitude)
+        
+        return jsonify({
+            'message': 'Report created successfully! NGO has been notified.',
+            'id': report_id,
+            'status': 'PENDING',
+            'assigned_ngo': nearest_ngo['name'] if nearest_ngo else 'No NGO found nearby',
+            'distance': f"{nearest_ngo['distance']} km" if nearest_ngo else None
+        }), 201
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/reports/<int:report_id>/status', methods=['PATCH'])
+def update_status(report_id):
+    """Update report status"""
+    try:
+        data = request.get_json()
+        new_status = data.get('status')
+        
+        if new_status not in ['PENDING', 'ON_THE_WAY', 'RESOLVED']:
+            return jsonify({'error': 'Invalid status'}), 400
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('UPDATE reports SET status = ? WHERE id = ?', (new_status, report_id))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'message': 'Status updated',
+            'id': report_id,
+            'status': new_status
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    """Serve uploaded files"""
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+@app.route('/api/ngos', methods=['GET'])
+def get_ngos():
+    """Get all NGOs"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM ngos ORDER BY name')
+    ngos = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return jsonify(ngos)
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
